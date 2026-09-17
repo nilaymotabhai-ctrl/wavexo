@@ -1,19 +1,24 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { CMSContent, Lead, ActivityEntry, MediaFile, AdminUser, Role, Visit } from "./types";
-import { DEFAULT_CONTENT, DEFAULT_PASSWORD, AUTH_KEY, CMS_KEY, SESSION_KEY } from "./data";
+import { DEFAULT_CONTENT, CMS_KEY } from "./data";
 import {
-  supabase, DOC_ID, buildDoc, fetchSiteDoc, saveSiteDoc,
+  supabase, SUPABASE_READY, DOC_ID, buildDoc, fetchSiteDoc, saveSiteDoc,
   fetchLeads, upsertLeadRow, deleteLeadRow,
   fetchVisits, insertVisitRow,
   fetchActivity, insertActivityRow, clearActivityRows,
 } from "./supabase";
 
 /* ------------------------------------------------------------------ */
-/* Wavexo CMS Store — Supabase-backed, realtime, cross-device.         */
-/* On boot it loads the shared cloud document + leads/visits/activity. */
-/* Every admin edit syncs to Postgres (debounced) and other open       */
-/* sessions receive updates via Supabase Realtime. If the database is  */
-/* unreachable the app transparently falls back to localStorage.       */
+/* Wavexo CMS Store — PRODUCTION                                       */
+/*                                                                     */
+/* Source of truth: Supabase Postgres (site_content doc + leads /      */
+/* visits / activity tables). localStorage is ONLY a render cache.     */
+/*                                                                     */
+/* Auth: Supabase Auth (email + password). Only authenticated admins   */
+/* can read leads/visits/activity or write ANY content — Row Level     */
+/* Security enforces it server-side; the client mirrors the same       */
+/* rules so the UI behaves cleanly. Public visitors get: site_content  */
+/* SELECT, leads/visits/activity INSERT, realtime content updates.     */
 /* ------------------------------------------------------------------ */
 
 type CollectionKey =
@@ -27,6 +32,7 @@ export type DbStatus = "connecting" | "online" | "local";
 interface CMSContextValue {
   content: CMSContent;
   dbStatus: DbStatus;
+  authReady: boolean;
   save: (patch: Partial<CMSContent>) => void;
   updateSettings: (patch: Partial<CMSContent["settings"]>) => void;
   updateHero: (patch: Partial<CMSContent["hero"]>) => void;
@@ -41,13 +47,13 @@ interface CMSContextValue {
   trackVisit: (path: string) => void;
   addMedia: (files: MediaFile[]) => void;
   deleteMedia: (id: string) => void;
-  // auth
+  // auth (Supabase Auth)
   user: Session | null;
-  login: (email: string, password: string) => { ok: boolean; error?: string };
-  logout: () => void;
-  logoutAll: () => void;
-  changePassword: (current: string, next: string) => { ok: boolean; error?: string };
-  resetPassword: (email: string, next: string) => { ok: boolean; error?: string };
+  login: (email: string, password: string) => Promise<{ ok: boolean; error?: string }>;
+  logout: () => Promise<void>;
+  logoutAll: () => Promise<void>;
+  changePassword: (current: string, next: string) => Promise<{ ok: boolean; error?: string }>;
+  resetPassword: (email: string) => Promise<{ ok: boolean; error?: string }>;
   saveUsers: (users: AdminUser[]) => void;
   can: (area: "content" | "leads" | "settings" | "users" | "delete") => boolean;
   resetAll: () => void;
@@ -57,7 +63,8 @@ interface CMSContextValue {
 
 const CMSContext = createContext<CMSContextValue | null>(null);
 
-function loadContent(): CMSContent {
+/* localStorage is a CACHE for instant first paint only — cloud wins online */
+function loadCache(): CMSContent {
   try {
     const raw = localStorage.getItem(CMS_KEY);
     if (raw) {
@@ -68,124 +75,84 @@ function loadContent(): CMSContent {
   return DEFAULT_CONTENT;
 }
 
-function loadPasswords(): Record<string, string> {
-  try {
-    const raw = localStorage.getItem(AUTH_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch { /* ignore */ }
-  return { "admin@wavexo.agency": DEFAULT_PASSWORD };
-}
-
 const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4);
 
 export function CMSProvider({ children }: { children: React.ReactNode }) {
-  const [content, setContent] = useState<CMSContent>(loadContent);
-  const [dbStatus, setDbStatus] = useState<DbStatus>("connecting");
-  const [user, setUser] = useState<Session | null>(() => {
-    try {
-      const raw = localStorage.getItem(SESSION_KEY);
-      return raw ? JSON.parse(raw) : null;
-    } catch { return null; }
-  });
+  const [content, setContent] = useState<CMSContent>(loadCache);
+  const [dbStatus, setDbStatus] = useState<DbStatus>(SUPABASE_READY ? "connecting" : "local");
+  const [user, setUser] = useState<Session | null>(null);
+  const [authReady, setAuthReady] = useState(!SUPABASE_READY);
 
-  const dbStatusRef = useRef<DbStatus>("connecting");
+  const dbStatusRef = useRef<DbStatus>(dbStatus);
+  const contentRef = useRef(content);
   const lastSavedDoc = useRef<string>("");
-  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const docEmptyRef = useRef(false);
+  const publicChannel = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const adminChannel = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const adminInitRef = useRef(false);
 
   useEffect(() => { dbStatusRef.current = dbStatus; }, [dbStatus]);
+  useEffect(() => { contentRef.current = content; }, [content]);
 
-  /* -------- local cache (instant paint + offline resilience) -------- */
+  const isAuthed = useCallback(() => user !== null, [user]);
+  const canWriteCloud = useCallback(() => dbStatusRef.current === "online" && isAuthed(), [isAuthed]);
+
+  /* -------- cache only (NOT the source of truth) -------- */
   useEffect(() => {
     try { localStorage.setItem(CMS_KEY, JSON.stringify(content)); } catch { /* full */ }
   }, [content]);
 
-  /* -------- debounced cloud sync of the content document -------- */
+  /* -------- admin-only write: debounced UPSERT of full content doc -------- */
   useEffect(() => {
-    if (dbStatus !== "online") return;
+    if (!canWriteCloud()) return;
     const doc = buildDoc(content);
     const str = JSON.stringify(doc);
     if (str === lastSavedDoc.current) return;
     const t = setTimeout(() => {
       lastSavedDoc.current = str;
-      saveSiteDoc(doc).catch(() => setDbStatus("local"));
+      saveSiteDoc(doc).catch(() => undefined);
     }, 900);
     return () => clearTimeout(t);
-  }, [content, dbStatus]);
+  }, [content, canWriteCloud]);
 
-  /* -------- bootstrap: pull cloud state + subscribe realtime -------- */
+  /* -------- public bootstrap: fetch 'main' doc + live content stream -------- */
   useEffect(() => {
+    if (!SUPABASE_READY) return;
     let cancelled = false;
 
     (async () => {
       try {
         const row = await fetchSiteDoc();
-        const [leads, visits, activity] = await Promise.all([fetchLeads().catch(() => [] as Lead[]), fetchVisits().catch(() => [] as Visit[]), fetchActivity().catch(() => [] as ActivityEntry[])]);
         if (cancelled) return;
-
         if (row?.data && Object.keys(row.data).length > 5) {
-          // cloud already seeded — remote is the shared source of truth
           const doc = row.data;
           lastSavedDoc.current = JSON.stringify(doc);
-          setContent(() => ({
+          setContent({
             ...DEFAULT_CONTENT, ...doc,
             settings: { ...DEFAULT_CONTENT.settings, ...(doc.settings || {}) },
-            leads, visits, activity,
-          } as CMSContent));
+            // protected collections stay empty until an admin signs in
+            leads: [], visits: [], activity: [],
+          } as CMSContent);
         } else {
-          // first connection: push existing content (defaults or local edits) up to the cloud
-          setContent((c) => {
-            const doc = buildDoc(c);
-            lastSavedDoc.current = JSON.stringify(doc);
-            void saveSiteDoc(doc).catch(() => undefined);
-            // seed the side tables too so every device sees the same data
-            c.leads.forEach((l) => void upsertLeadRow(l).catch(() => undefined));
-            c.activity.forEach((a) => void insertActivityRow(a).catch(() => undefined));
-            return { ...c, leads: c.leads.length ? c.leads : leads, visits: c.visits.length ? c.visits : visits, activity: c.activity.length ? c.activity : activity };
-          });
+          docEmptyRef.current = true; // first run — an admin sign-in will seed the cloud
         }
-        if (cancelled) return;
         setDbStatus("online");
 
-        /* realtime — receive edits made on other devices */
-        channelRef.current = supabase
-          .channel("wavexo-cms-sync")
+        /* realtime: public pages update live the moment an admin saves */
+        publicChannel.current = supabase
+          .channel("wavexo-public-content")
           .on("postgres_changes", { event: "*", schema: "public", table: "site_content" }, (payload) => {
-            const incoming = (payload.new as { id?: string; data?: Partial<CMSContent> })?.data;
-            if (!incoming || (payload.new as { id?: string }).id !== DOC_ID) return;
-            const str = JSON.stringify(incoming);
-            if (str === lastSavedDoc.current) return; // our own write echo
+            const row2 = payload.new as { id?: string; data?: Partial<CMSContent> };
+            if (!row2?.data || row2.id !== DOC_ID) return;
+            const str = JSON.stringify(row2.data);
+            if (str === lastSavedDoc.current) return;
             lastSavedDoc.current = str;
             setContent((prev) => ({
-              ...prev, ...incoming,
-              settings: { ...prev.settings, ...(incoming.settings || {}) },
+              ...prev, ...row2.data!,
+              settings: { ...prev.settings, ...(row2.data!.settings || {}) },
             } as CMSContent));
           })
-          .on("postgres_changes", { event: "INSERT", schema: "public", table: "leads" }, (payload) => {
-            const lead = (payload.new as { payload?: Lead })?.payload;
-            if (!lead?.id) return;
-            setContent((prev) => prev.leads.some((l) => l.id === lead.id) ? prev : { ...prev, leads: [lead, ...prev.leads] });
-          })
-          .on("postgres_changes", { event: "UPDATE", schema: "public", table: "leads" }, (payload) => {
-            const lead = (payload.new as { payload?: Lead })?.payload;
-            if (!lead?.id) return;
-            setContent((prev) => ({ ...prev, leads: prev.leads.map((l) => (l.id === lead.id ? lead : l)) }));
-          })
-          .on("postgres_changes", { event: "DELETE", schema: "public", table: "leads" }, (payload) => {
-            const id = (payload.old as { id?: string })?.id;
-            if (!id) return;
-            setContent((prev) => ({ ...prev, leads: prev.leads.filter((l) => l.id !== id) }));
-          })
-          .on("postgres_changes", { event: "INSERT", schema: "public", table: "activity" }, (payload) => {
-            const r = payload.new as { id: string; t: number; user_name: string; action: string; detail: string };
-            if (!r?.id) return;
-            setContent((prev) => prev.activity.some((a) => a.id === r.id) ? prev : {
-              ...prev,
-              activity: [{ id: r.id, t: Number(r.t), user: r.user_name, action: r.action, detail: r.detail }, ...prev.activity].slice(0, 300),
-            });
-          })
-          .subscribe((status) => {
-            if (status === "CHANNEL_ERROR") setDbStatus((s) => (s === "online" ? "local" : s));
-          });
+          .subscribe();
       } catch {
         if (!cancelled) setDbStatus("local");
       }
@@ -193,19 +160,94 @@ export function CMSProvider({ children }: { children: React.ReactNode }) {
 
     return () => {
       cancelled = true;
-      if (channelRef.current) void supabase.removeChannel(channelRef.current);
+      if (publicChannel.current) void supabase.removeChannel(publicChannel.current);
+      if (adminChannel.current) void supabase.removeChannel(adminChannel.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => {
+  /* -------- admin init: after auth, load protected data + admin stream -------- */
+  const initAdminData = useCallback(async () => {
     try {
-      if (user) localStorage.setItem(SESSION_KEY, JSON.stringify(user));
-      else localStorage.removeItem(SESSION_KEY);
-    } catch { /* ignore */ }
-  }, [user]);
+      const [leads, visits, activity] = await Promise.all([
+        fetchLeads().catch(() => [] as Lead[]),
+        fetchVisits().catch(() => [] as Visit[]),
+        fetchActivity().catch(() => [] as ActivityEntry[]),
+      ]);
+      setContent((c) => ({ ...c, leads: leads.length ? leads : c.leads, visits: visits.length ? visits : c.visits, activity }));
+      if (adminChannel.current) void supabase.removeChannel(adminChannel.current);
+      adminChannel.current = supabase
+        .channel("wavexo-admin-feed")
+        .on("postgres_changes", { event: "INSERT", schema: "public", table: "leads" }, (payload) => {
+          const lead = (payload.new as { payload?: Lead })?.payload;
+          if (!lead?.id) return;
+          setContent((prev) => prev.leads.some((l) => l.id === lead.id) ? prev : { ...prev, leads: [lead, ...prev.leads] });
+        })
+        .on("postgres_changes", { event: "UPDATE", schema: "public", table: "leads" }, (payload) => {
+          const lead = (payload.new as { payload?: Lead })?.payload;
+          if (!lead?.id) return;
+          setContent((prev) => ({ ...prev, leads: prev.leads.map((l) => (l.id === lead.id ? lead : l)) }));
+        })
+        .on("postgres_changes", { event: "DELETE", schema: "public", table: "leads" }, (payload) => {
+          const id = (payload.old as { id?: string })?.id;
+          if (id) setContent((prev) => ({ ...prev, leads: prev.leads.filter((l) => l.id !== id) }));
+        })
+        .on("postgres_changes", { event: "INSERT", schema: "public", table: "activity" }, (payload) => {
+          const r = payload.new as { id: string; t: number; user_name: string; action: string; detail: string };
+          if (!r?.id) return;
+          setContent((prev) => prev.activity.some((a) => a.id === r.id) ? prev : {
+            ...prev,
+            activity: [{ id: r.id, t: Number(r.t), user: r.user_name, action: r.action, detail: r.detail }, ...prev.activity].slice(0, 300),
+          });
+        })
+        .subscribe();
+    } catch { /* stays usable */ }
+  }, []);
 
-  /* ---------------- mutations ---------------- */
+  /* -------- Supabase Auth session handling -------- */
+  useEffect(() => {
+    if (!SUPABASE_READY) { setAuthReady(true); return; }
+
+    const resolveSession = async (authUser: { id: string; email?: string } | null) => {
+      if (authUser?.email) {
+        const email = authUser.email;
+        const match = contentRef.current.users.find((u) => u.email.toLowerCase() === email.toLowerCase());
+        const role: Role = match?.role ?? "superadmin"; // only Supabase-Auth users can sign in at all
+        setUser({ userId: authUser.id, email, name: match?.name || email.split("@")[0], role, t: Date.now() });
+        setContent((c) => ({
+          ...c,
+          users: match ? c.users.map((u) => (u.id === match.id ? { ...u, lastActive: Date.now() } : u)) : c.users,
+        }));
+        if (!adminInitRef.current) {
+          adminInitRef.current = true;
+          await initAdminData();
+        }
+        // first-ever run: seed the cloud document now that writes are allowed
+        if (docEmptyRef.current) {
+          docEmptyRef.current = false;
+          const doc = buildDoc(contentRef.current);
+          lastSavedDoc.current = JSON.stringify(doc);
+          void saveSiteDoc(doc).catch(() => undefined);
+        }
+      } else {
+        setUser(null);
+        adminInitRef.current = false;
+        if (adminChannel.current) { void supabase.removeChannel(adminChannel.current); adminChannel.current = null; }
+        // privacy: drop protected collections for signed-out/public viewers
+        setContent((c) => ({ ...c, leads: [], visits: [], activity: [] }));
+      }
+      setAuthReady(true);
+    };
+
+    void supabase.auth.getSession().then(({ data }) => resolveSession(data.session?.user ?? null));
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      void resolveSession(session?.user ?? null);
+    });
+    return () => sub.subscription.unsubscribe();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /* ---------------- content mutations (UI unchanged) ---------------- */
 
   const save = useCallback((patch: Partial<CMSContent>) => {
     setContent((c) => ({ ...c, ...patch }));
@@ -227,8 +269,8 @@ export function CMSProvider({ children }: { children: React.ReactNode }) {
 
   const clearActivity = useCallback(() => {
     setContent((c) => ({ ...c, activity: [] }));
-    if (dbStatusRef.current === "online") void clearActivityRows().catch(() => undefined);
-  }, []);
+    if (canWriteCloud()) void clearActivityRows().catch(() => undefined);
+  }, [canWriteCloud]);
 
   const upsert = useCallback(<K extends CollectionKey>(key: K, item: CMSContent[K][number] & { id: string }) => {
     setContent((c) => {
@@ -254,6 +296,8 @@ export function CMSProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  /* -------- leads: public INSERT, admin reads/updates (RLS enforced) -------- */
+
   const addLead = useCallback<CMSContextValue["addLead"]>((lead) => {
     const full: Lead = {
       id: uid(), createdAt: Date.now(), read: false, status: "new",
@@ -272,15 +316,15 @@ export function CMSProvider({ children }: { children: React.ReactNode }) {
     setContent((c) => {
       const updated = c.leads.map((l) => (l.id === id ? { ...l, ...patch } : l));
       const full = updated.find((l) => l.id === id);
-      if (full && dbStatusRef.current === "online") void upsertLeadRow(full).catch(() => undefined);
+      if (full && canWriteCloud()) void upsertLeadRow(full).catch(() => undefined);
       return { ...c, leads: updated };
     });
-  }, []);
+  }, [canWriteCloud]);
 
   const deleteLead = useCallback((id: string) => {
     setContent((c) => ({ ...c, leads: c.leads.filter((l) => l.id !== id) }));
-    if (dbStatusRef.current === "online") void deleteLeadRow(id).catch(() => undefined);
-  }, []);
+    if (canWriteCloud()) void deleteLeadRow(id).catch(() => undefined);
+  }, [canWriteCloud]);
 
   const trackVisit = useCallback((path: string) => {
     const visit: Visit = {
@@ -300,52 +344,50 @@ export function CMSProvider({ children }: { children: React.ReactNode }) {
     setContent((c) => ({ ...c, media: c.media.filter((m) => m.id !== id) }));
   }, []);
 
-  /* ---------------- auth (client-side workspace credentials) ---------------- */
+  /* ---------------- Supabase Auth ---------------- */
 
-  const login = useCallback((email: string, password: string) => {
-    const pwds = loadPasswords();
-    const u = content.users.find((x) => x.email.toLowerCase() === email.toLowerCase());
-    if (!u || pwds[u.email] !== password) return { ok: false, error: "Invalid email or password." };
-    const session: Session = { userId: u.id, email: u.email, name: u.name, role: u.role, t: Date.now() };
-    setUser(session);
-    const entry: ActivityEntry = { id: uid(), t: Date.now(), user: u.name, action: "Login", detail: `Signed in as ${u.email}` };
-    setContent((c) => ({
-      ...c,
-      users: c.users.map((x) => (x.id === u.id ? { ...x, lastActive: Date.now() } : x)),
-      activity: [entry, ...c.activity].slice(0, 300),
-    }));
-    if (dbStatusRef.current === "online") void insertActivityRow(entry).catch(() => undefined);
+  const login = useCallback(async (email: string, password: string) => {
+    if (!SUPABASE_READY) return { ok: false, error: "Supabase is not configured. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY." };
+    const { error } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
+    if (error) return { ok: false, error: error.message === "Invalid login credentials" ? "Invalid email or password." : error.message };
+    const entry: ActivityEntry = { id: uid(), t: Date.now(), user: email.split("@")[0], action: "Login", detail: `Signed in as ${email}` };
+    void insertActivityRow(entry).catch(() => undefined);
     return { ok: true };
-  }, [content.users]);
+  }, []);
 
-  const logout = useCallback(() => setUser(null), []);
-  const logoutAll = useCallback(() => setUser(null), []);
+  const logout = useCallback(async () => {
+    if (SUPABASE_READY) await supabase.auth.signOut();
+    setUser(null);
+  }, []);
 
-  const changePassword = useCallback((current: string, next: string) => {
+  const logoutAll = useCallback(async () => {
+    if (SUPABASE_READY) await supabase.auth.signOut({ scope: "global" });
+    setUser(null);
+  }, []);
+
+  const changePassword = useCallback(async (current: string, next: string) => {
     if (!user) return { ok: false, error: "Not signed in." };
-    const pwds = loadPasswords();
-    if (pwds[user.email] !== current) return { ok: false, error: "Current password is incorrect." };
     if (next.length < 8) return { ok: false, error: "Password must be at least 8 characters." };
-    pwds[user.email] = next;
-    localStorage.setItem(AUTH_KEY, JSON.stringify(pwds));
+    // verify current password first
+    const check = await supabase.auth.signInWithPassword({ email: user.email, password: current });
+    if (check.error) return { ok: false, error: "Current password is incorrect." };
+    const { error } = await supabase.auth.updateUser({ password: next });
+    if (error) return { ok: false, error: error.message };
     log("Password changed", user.email);
     return { ok: true };
   }, [user, log]);
 
-  const resetPassword = useCallback((email: string, next: string) => {
-    const pwds = loadPasswords();
-    const target = content.users.find((x) => x.email.toLowerCase() === email.toLowerCase());
-    if (!target) return { ok: false, error: "No admin account found for that email." };
-    pwds[target.email] = next;
-    localStorage.setItem(AUTH_KEY, JSON.stringify(pwds));
+  const resetPassword = useCallback(async (email: string) => {
+    if (!SUPABASE_READY) return { ok: false, error: "Supabase is not configured." };
+    const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+      redirectTo: `${window.location.origin}/admin/login`,
+    });
+    if (error) return { ok: false, error: error.message };
     return { ok: true };
-  }, [content.users]);
+  }, []);
 
   const saveUsers = useCallback((users: AdminUser[]) => {
     setContent((c) => ({ ...c, users }));
-    const pwds = loadPasswords();
-    users.forEach((u) => { if (!pwds[u.email]) pwds[u.email] = DEFAULT_PASSWORD; });
-    localStorage.setItem(AUTH_KEY, JSON.stringify(pwds));
   }, []);
 
   const can = useCallback((area: "content" | "leads" | "settings" | "users" | "delete") => {
@@ -363,7 +405,7 @@ export function CMSProvider({ children }: { children: React.ReactNode }) {
   const resetAll = useCallback(() => {
     localStorage.removeItem(CMS_KEY);
     setContent(DEFAULT_CONTENT);
-    if (dbStatusRef.current === "online") {
+    if (canWriteCloud()) {
       const c = DEFAULT_CONTENT;
       void saveSiteDoc(buildDoc(c)).catch(() => undefined);
       void (async () => {
@@ -373,10 +415,10 @@ export function CMSProvider({ children }: { children: React.ReactNode }) {
           await supabase.from("visits").delete().gt("id", 0);
           await supabase.from("activity").delete().neq("id", "");
           await Promise.all(c.activity.map((a) => insertActivityRow(a).catch(() => undefined)));
-        } catch { /* cloud wipe best-effort */ }
+        } catch { /* best effort */ }
       })();
     }
-  }, []);
+  }, [canWriteCloud]);
 
   const exportData = useCallback(() => {
     const blob = new Blob([JSON.stringify(content, null, 2)], { type: "application/json" });
@@ -396,11 +438,11 @@ export function CMSProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const value = useMemo<CMSContextValue>(() => ({
-    content, dbStatus, save, updateSettings, updateHero, upsert, remove, move,
+    content, dbStatus, authReady, save, updateSettings, updateHero, upsert, remove, move,
     addLead, updateLead, deleteLead, log, clearActivity, trackVisit, addMedia, deleteMedia,
     user, login, logout, logoutAll, changePassword, resetPassword, saveUsers, can,
     resetAll, exportData, importData,
-  }), [content, dbStatus, save, updateSettings, updateHero, upsert, remove, move, addLead, updateLead, deleteLead, log, clearActivity, trackVisit, addMedia, deleteMedia, user, login, logout, logoutAll, changePassword, resetPassword, saveUsers, can, resetAll, exportData, importData]);
+  }), [content, dbStatus, authReady, save, updateSettings, updateHero, upsert, remove, move, addLead, updateLead, deleteLead, log, clearActivity, trackVisit, addMedia, deleteMedia, user, login, logout, logoutAll, changePassword, resetPassword, saveUsers, can, resetAll, exportData, importData]);
 
   return <CMSContext.Provider value={value}>{children}</CMSContext.Provider>;
 }

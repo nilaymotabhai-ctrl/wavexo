@@ -107,9 +107,9 @@ export default function Settings() {
               <AInput type="password" value={pw.current} onChange={(e) => setPw({ ...pw, current: e.target.value })} placeholder="Current password" />
               <AInput type="password" value={pw.next} onChange={(e) => setPw({ ...pw, next: e.target.value })} placeholder="New password (min 8 chars)" />
               <AInput type="password" value={pw.confirm} onChange={(e) => setPw({ ...pw, confirm: e.target.value })} placeholder="Confirm new password" />
-              <AButton className="w-fit" onClick={() => {
+              <AButton className="w-fit" onClick={async () => {
                 if (pw.next !== pw.confirm) { toast("Passwords do not match"); return; }
-                const r = changePassword(pw.current, pw.next);
+                const r = await changePassword(pw.current, pw.next);
                 toast(r.ok ? "Password updated" : r.error || "Failed");
                 if (r.ok) setPw({ current: "", next: "", confirm: "" });
               }}>Update password</AButton>
@@ -183,7 +183,10 @@ export default function Settings() {
                 </div>
               ))}
             </div>
-            <div className="mt-5 grid gap-2 border-t border-white/[0.07] pt-5 sm:grid-cols-[1fr_1fr_180px_auto]">
+            <p className="mt-4 rounded-xl border border-white/[0.08] bg-white/[0.03] px-4 py-3 text-[11px] leading-relaxed text-faint">
+              Logins are handled by <b className="text-white">Supabase Auth</b>. Create the login in <b className="text-white">Supabase Dashboard → Authentication → Users → Add user</b>, then add the same email here to assign their role (default role for unlisted emails: Super Admin).
+            </p>
+            <div className="mt-3 grid gap-2 border-t border-white/[0.07] pt-5 sm:grid-cols-[1fr_1fr_180px_auto]">
               <AInput value={newUser.name} onChange={(e) => setNewUser({ ...newUser, name: e.target.value })} placeholder="Full name" />
               <AInput value={newUser.email} onChange={(e) => setNewUser({ ...newUser, email: e.target.value })} placeholder="email@wavexo.agency" />
               <ASelect value={newUser.role} onChange={(e) => setNewUser({ ...newUser, role: e.target.value as Role })}>
@@ -195,7 +198,7 @@ export default function Settings() {
                 saveUsers([...content.users, { id: newId(), name: newUser.name, email: newUser.email, role: newUser.role } as AdminUser]);
                 log("User added", `${newUser.email} (${newUser.role})`);
                 setNewUser({ name: "", email: "", role: "editor" });
-                toast("User added — default password wavexo2024");
+                toast("Role assigned — create their login in Supabase Auth");
               }}><Plus className="h-4 w-4" /> Add user</AButton>
             </div>
           </ACard>

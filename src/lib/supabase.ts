@@ -2,19 +2,31 @@ import { createClient } from "@supabase/supabase-js";
 import { ActivityEntry, CMSContent, Lead, Visit } from "./types";
 
 /* ------------------------------------------------------------------
-   Supabase connection for the Wavexo CMS.
-   Content lives in Postgres (site_content document + leads / visits /
-   activity tables). Images & files go to the public `media` bucket.
-   The app falls back to localStorage automatically if the database
-   is unreachable, so the site never breaks.
+   Supabase client — production configuration.
+   Keys come ONLY from environment variables (never hardcoded):
+     VITE_SUPABASE_URL
+     VITE_SUPABASE_ANON_KEY
+   Row Level Security is the real guard:
+     · public  → read site_content, insert leads/visits/activity
+     · admin   → full access after Supabase Auth sign-in
+   If env vars are missing the app runs in local fallback mode.
 ------------------------------------------------------------------- */
 
-export const SUPABASE_URL = "https://ebddoqzvmqbtrfortfmu.supabase.co";
-export const SUPABASE_ANON_KEY = "sb_publishable_SsrlZ9b9gtgP20ydkxrVLQ_EEKZeTL6";
+const URL = import.meta.env.VITE_SUPABASE_URL as string | undefined;
+const ANON = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
 
-export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+export const SUPABASE_READY = Boolean(URL && ANON);
+
+export const supabase = createClient(
+  URL || "https://not-configured.supabase.co",
+  ANON || "not-configured"
+);
 
 export const DOC_ID = "main";
+
+function assertReady() {
+  if (!SUPABASE_READY) throw new Error("Supabase env vars are not configured");
+}
 
 /* The content document excludes high-frequency tables (leads, visits,
    activity) — those sync through their own tables. */
@@ -26,6 +38,7 @@ export function buildDoc(content: CMSContent): Omit<CMSContent, "leads" | "visit
 /* ---------------- site content document ---------------- */
 
 export async function fetchSiteDoc(): Promise<{ data: Partial<CMSContent>; updated_at: string } | null> {
+  assertReady();
   const { data, error } = await supabase
     .from("site_content").select("data, updated_at").eq("id", DOC_ID).maybeSingle();
   if (error) throw error;
@@ -33,15 +46,17 @@ export async function fetchSiteDoc(): Promise<{ data: Partial<CMSContent>; updat
 }
 
 export async function saveSiteDoc(doc: unknown) {
+  assertReady();
   const { error } = await supabase
     .from("site_content")
     .upsert({ id: DOC_ID, data: doc, updated_at: new Date().toISOString() });
   if (error) throw error;
 }
 
-/* ---------------- leads ---------------- */
+/* ---------------- leads (admin read; public insert) ---------------- */
 
 export async function fetchLeads(): Promise<Lead[]> {
+  assertReady();
   const { data, error } = await supabase
     .from("leads").select("id, payload").order("created_at", { ascending: false }).limit(500);
   if (error) throw error;
@@ -49,11 +64,13 @@ export async function fetchLeads(): Promise<Lead[]> {
 }
 
 export async function upsertLeadRow(lead: Lead) {
+  assertReady();
   const { error } = await supabase.from("leads").upsert({ id: lead.id, payload: lead });
   if (error) throw error;
 }
 
 export async function deleteLeadRow(id: string) {
+  assertReady();
   const { error } = await supabase.from("leads").delete().eq("id", id);
   if (error) throw error;
 }
@@ -61,6 +78,7 @@ export async function deleteLeadRow(id: string) {
 /* ---------------- visits ---------------- */
 
 export async function fetchVisits(): Promise<Visit[]> {
+  assertReady();
   const { data, error } = await supabase
     .from("visits").select("t, path, device, source").order("t", { ascending: false }).limit(1000);
   if (error) throw error;
@@ -75,6 +93,7 @@ export async function fetchVisits(): Promise<Visit[]> {
 }
 
 export async function insertVisitRow(v: Visit) {
+  assertReady();
   const { error } = await supabase.from("visits").insert({
     t: new Date(v.t).toISOString(), path: v.path, device: v.device, source: v.source,
   });
@@ -84,6 +103,7 @@ export async function insertVisitRow(v: Visit) {
 /* ---------------- activity ---------------- */
 
 export async function fetchActivity(): Promise<ActivityEntry[]> {
+  assertReady();
   const { data, error } = await supabase
     .from("activity").select("id, t, user_name, action, detail").order("t", { ascending: false }).limit(300);
   if (error) throw error;
@@ -91,11 +111,13 @@ export async function fetchActivity(): Promise<ActivityEntry[]> {
 }
 
 export async function insertActivityRow(a: ActivityEntry) {
+  assertReady();
   const { error } = await supabase.from("activity").insert({ id: a.id, t: a.t, user_name: a.user, action: a.action, detail: a.detail });
   if (error) throw error;
 }
 
 export async function clearActivityRows() {
+  assertReady();
   const { error } = await supabase.from("activity").delete().neq("id", "");
   if (error) throw error;
 }
@@ -130,6 +152,7 @@ export function imageToWebpParts(file: File, maxW = 1200, quality = 0.82): Promi
 
 /* Uploads a blob to the public `media` bucket; returns its public URL or null on failure. */
 export async function uploadToMediaBucket(blob: Blob, ext: string, contentType: string): Promise<string | null> {
+  if (!SUPABASE_READY) return null;
   try {
     const path = `uploads/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
     const { error } = await supabase.storage.from("media").upload(path, blob, { contentType, cacheControl: "31536000", upsert: false });

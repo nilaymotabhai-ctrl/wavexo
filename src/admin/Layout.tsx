@@ -106,7 +106,7 @@ function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
 }
 
 export default function AdminLayout() {
-  const { user, content, logout, updateLead } = useCMS();
+  const { user, authReady, content, logout, updateLead } = useCMS();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [bellOpen, setBellOpen] = useState(false);
   const navigate = useNavigate();
@@ -115,6 +115,22 @@ export default function AdminLayout() {
     () => content.leads.filter((l) => !l.read && !l.archived).slice(0, 6),
     [content.leads]
   );
+
+  /* wait for Supabase session hydration before deciding access */
+  if (!authReady) {
+    return (
+      <div className="grid min-h-screen place-items-center bg-[#060912]">
+        <div className="flex flex-col items-center gap-4">
+          <span className="grid h-14 w-14 place-items-center rounded-2xl bg-gradient-to-br from-cyanx via-electric to-violetx shadow-[0_16px_50px_-12px_rgba(37,99,235,0.9)]">
+            <svg viewBox="0 0 24 24" className="h-7 w-7 animate-pulse" fill="none" stroke="white" strokeWidth="2.3" strokeLinecap="round">
+              <path d="M2 14c2.5-6 4.5-6 7 0s4.5 6 7 0 3.5-5 6-2.5" />
+            </svg>
+          </span>
+          <p className="text-xs font-medium uppercase tracking-[0.25em] text-faint">Verifying session…</p>
+        </div>
+      </div>
+    );
+  }
 
   if (!user) return <Navigate to="/admin/login" replace />;
 
