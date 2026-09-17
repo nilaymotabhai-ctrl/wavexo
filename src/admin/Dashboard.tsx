@@ -8,6 +8,13 @@ import { useCMS, timeAgo, formatDate } from "../lib/store";
 import { ACard, SectionTitle, Pill } from "./ui";
 import { cn } from "../utils/cn";
 
+function DbPill() {
+  const { dbStatus } = useCMS();
+  if (dbStatus === "connecting") return <Pill tone="amber">Cloud: connecting…</Pill>;
+  if (dbStatus === "online") return <Pill tone="green">Cloud: synced · Supabase</Pill>;
+  return <Pill tone="rose">Cloud: offline — local mode</Pill>;
+}
+
 const SOURCE_COLORS: Record<string, string> = {
   contact: "#22d3ee", audit: "#8b5cf6", consultation: "#d946ef",
   newsletter: "#34d399", whatsapp: "#4ade80", service: "#60a5fa",
@@ -100,7 +107,8 @@ export default function Dashboard() {
         title={`Welcome back, ${user?.name.split(" ")[0] || "Admin"}`}
         sub={new Date().toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}
         right={
-          <div className="flex gap-2">
+          <div className="flex items-center gap-2">
+            <DbPill />
             <Link to="/admin/blog" className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-4 py-2.5 text-[13px] font-semibold text-white/80 transition hover:text-white">
               <PenSquare className="h-4 w-4" /> New blog post
             </Link>

@@ -4,7 +4,7 @@ import { useCMS, timeAgo, formatDate } from "../lib/store";
 import { AButton, ACard, ASearch, SectionTitle, Pill, Confirm, toast } from "./ui";
 
 export default function ActivityLog() {
-  const { content, save, can } = useCMS();
+  const { content, clearActivity, can } = useCMS();
   const [q, setQ] = useState("");
   const [confirmClear, setConfirmClear] = useState(false);
 
@@ -44,7 +44,7 @@ export default function ActivityLog() {
       )}
 
       <Confirm open={confirmClear} onClose={() => setConfirmClear(false)}
-        onConfirm={() => { save({ activity: [] }); toast("Activity log cleared"); }}
+        onConfirm={() => { clearActivity(); toast("Activity log cleared"); }}
         title="Clear the activity log?" message="History up to this point will be permanently removed." />
     </div>
   );

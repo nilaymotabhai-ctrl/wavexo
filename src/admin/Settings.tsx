@@ -10,6 +10,13 @@ import { cn } from "../utils/cn";
 
 type Tab = "integrations" | "security" | "users" | "backup";
 
+function DbBadge() {
+  const { dbStatus } = useCMS();
+  if (dbStatus === "connecting") return <Pill tone="amber">Connecting…</Pill>;
+  if (dbStatus === "online") return <Pill tone="green">Connected · realtime sync on</Pill>;
+  return <Pill tone="rose">Offline — using local storage</Pill>;
+}
+
 const ROLES: { id: Role; label: string; desc: string }[] = [
   { id: "superadmin", label: "Super Admin", desc: "Full access to everything" },
   { id: "editor", label: "Editor", desc: "Manage content, blog, services, portfolio" },
@@ -228,6 +235,15 @@ export default function Settings() {
       {/* ---------------- backup ---------------- */}
       {tab === "backup" && (
         <div className="space-y-5">
+          <ACard>
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div>
+                <h3 className="font-display text-[15px] font-bold text-white">Cloud database</h3>
+                <p className="mt-1 text-[12px] text-faint">All admin changes sync to Supabase Postgres and appear on every device in real time.</p>
+              </div>
+              {content && <DbBadge />}
+            </div>
+          </ACard>
           <ACard>
             <h3 className="font-display flex items-center gap-2 text-[15px] font-bold text-white"><Download className="h-4 w-4 text-cyan-300" /> Export full backup</h3>
             <p className="mt-1 text-[12px] text-faint">Download every setting, page, service, blog, lead and file as a single JSON file.</p>

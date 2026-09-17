@@ -1,12 +1,19 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { CMSContent, Lead, ActivityEntry, MediaFile, AdminUser, Role, Visit } from "./types";
 import { DEFAULT_CONTENT, DEFAULT_PASSWORD, AUTH_KEY, CMS_KEY, SESSION_KEY } from "./data";
+import {
+  supabase, DOC_ID, buildDoc, fetchSiteDoc, saveSiteDoc,
+  fetchLeads, upsertLeadRow, deleteLeadRow,
+  fetchVisits, insertVisitRow,
+  fetchActivity, insertActivityRow, clearActivityRows,
+} from "./supabase";
 
 /* ------------------------------------------------------------------ */
-/* Wavexo CMS Store — localStorage-persisted content engine.           */
-/* Public pages read from here; the Admin Panel writes to here.        */
-/* Swap the persistence layer for Supabase/Firebase without touching   */
-/* any UI — every component only talks to this context.                */
+/* Wavexo CMS Store — Supabase-backed, realtime, cross-device.         */
+/* On boot it loads the shared cloud document + leads/visits/activity. */
+/* Every admin edit syncs to Postgres (debounced) and other open       */
+/* sessions receive updates via Supabase Realtime. If the database is  */
+/* unreachable the app transparently falls back to localStorage.       */
 /* ------------------------------------------------------------------ */
 
 type CollectionKey =
@@ -15,8 +22,11 @@ type CollectionKey =
 
 interface Session { userId: string; email: string; name: string; role: Role; t: number }
 
+export type DbStatus = "connecting" | "online" | "local";
+
 interface CMSContextValue {
   content: CMSContent;
+  dbStatus: DbStatus;
   save: (patch: Partial<CMSContent>) => void;
   updateSettings: (patch: Partial<CMSContent["settings"]>) => void;
   updateHero: (patch: Partial<CMSContent["hero"]>) => void;
@@ -27,6 +37,7 @@ interface CMSContextValue {
   updateLead: (id: string, patch: Partial<Lead>) => void;
   deleteLead: (id: string) => void;
   log: (action: string, detail: string) => void;
+  clearActivity: () => void;
   trackVisit: (path: string) => void;
   addMedia: (files: MediaFile[]) => void;
   deleteMedia: (id: string) => void;
@@ -51,7 +62,6 @@ function loadContent(): CMSContent {
     const raw = localStorage.getItem(CMS_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      // merge with defaults so new fields appear after updates
       return { ...DEFAULT_CONTENT, ...parsed, settings: { ...DEFAULT_CONTENT.settings, ...(parsed.settings || {}) } };
     }
   } catch { /* ignore */ }
@@ -70,6 +80,7 @@ const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(3
 
 export function CMSProvider({ children }: { children: React.ReactNode }) {
   const [content, setContent] = useState<CMSContent>(loadContent);
+  const [dbStatus, setDbStatus] = useState<DbStatus>("connecting");
   const [user, setUser] = useState<Session | null>(() => {
     try {
       const raw = localStorage.getItem(SESSION_KEY);
@@ -77,9 +88,115 @@ export function CMSProvider({ children }: { children: React.ReactNode }) {
     } catch { return null; }
   });
 
+  const dbStatusRef = useRef<DbStatus>("connecting");
+  const lastSavedDoc = useRef<string>("");
+  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+
+  useEffect(() => { dbStatusRef.current = dbStatus; }, [dbStatus]);
+
+  /* -------- local cache (instant paint + offline resilience) -------- */
   useEffect(() => {
-    try { localStorage.setItem(CMS_KEY, JSON.stringify(content)); } catch { /* storage full */ }
+    try { localStorage.setItem(CMS_KEY, JSON.stringify(content)); } catch { /* full */ }
   }, [content]);
+
+  /* -------- debounced cloud sync of the content document -------- */
+  useEffect(() => {
+    if (dbStatus !== "online") return;
+    const doc = buildDoc(content);
+    const str = JSON.stringify(doc);
+    if (str === lastSavedDoc.current) return;
+    const t = setTimeout(() => {
+      lastSavedDoc.current = str;
+      saveSiteDoc(doc).catch(() => setDbStatus("local"));
+    }, 900);
+    return () => clearTimeout(t);
+  }, [content, dbStatus]);
+
+  /* -------- bootstrap: pull cloud state + subscribe realtime -------- */
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const row = await fetchSiteDoc();
+        const [leads, visits, activity] = await Promise.all([fetchLeads().catch(() => [] as Lead[]), fetchVisits().catch(() => [] as Visit[]), fetchActivity().catch(() => [] as ActivityEntry[])]);
+        if (cancelled) return;
+
+        if (row?.data && Object.keys(row.data).length > 5) {
+          // cloud already seeded — remote is the shared source of truth
+          const doc = row.data;
+          lastSavedDoc.current = JSON.stringify(doc);
+          setContent(() => ({
+            ...DEFAULT_CONTENT, ...doc,
+            settings: { ...DEFAULT_CONTENT.settings, ...(doc.settings || {}) },
+            leads, visits, activity,
+          } as CMSContent));
+        } else {
+          // first connection: push existing content (defaults or local edits) up to the cloud
+          setContent((c) => {
+            const doc = buildDoc(c);
+            lastSavedDoc.current = JSON.stringify(doc);
+            void saveSiteDoc(doc).catch(() => undefined);
+            // seed the side tables too so every device sees the same data
+            c.leads.forEach((l) => void upsertLeadRow(l).catch(() => undefined));
+            c.activity.forEach((a) => void insertActivityRow(a).catch(() => undefined));
+            return { ...c, leads: c.leads.length ? c.leads : leads, visits: c.visits.length ? c.visits : visits, activity: c.activity.length ? c.activity : activity };
+          });
+        }
+        if (cancelled) return;
+        setDbStatus("online");
+
+        /* realtime — receive edits made on other devices */
+        channelRef.current = supabase
+          .channel("wavexo-cms-sync")
+          .on("postgres_changes", { event: "*", schema: "public", table: "site_content" }, (payload) => {
+            const incoming = (payload.new as { id?: string; data?: Partial<CMSContent> })?.data;
+            if (!incoming || (payload.new as { id?: string }).id !== DOC_ID) return;
+            const str = JSON.stringify(incoming);
+            if (str === lastSavedDoc.current) return; // our own write echo
+            lastSavedDoc.current = str;
+            setContent((prev) => ({
+              ...prev, ...incoming,
+              settings: { ...prev.settings, ...(incoming.settings || {}) },
+            } as CMSContent));
+          })
+          .on("postgres_changes", { event: "INSERT", schema: "public", table: "leads" }, (payload) => {
+            const lead = (payload.new as { payload?: Lead })?.payload;
+            if (!lead?.id) return;
+            setContent((prev) => prev.leads.some((l) => l.id === lead.id) ? prev : { ...prev, leads: [lead, ...prev.leads] });
+          })
+          .on("postgres_changes", { event: "UPDATE", schema: "public", table: "leads" }, (payload) => {
+            const lead = (payload.new as { payload?: Lead })?.payload;
+            if (!lead?.id) return;
+            setContent((prev) => ({ ...prev, leads: prev.leads.map((l) => (l.id === lead.id ? lead : l)) }));
+          })
+          .on("postgres_changes", { event: "DELETE", schema: "public", table: "leads" }, (payload) => {
+            const id = (payload.old as { id?: string })?.id;
+            if (!id) return;
+            setContent((prev) => ({ ...prev, leads: prev.leads.filter((l) => l.id !== id) }));
+          })
+          .on("postgres_changes", { event: "INSERT", schema: "public", table: "activity" }, (payload) => {
+            const r = payload.new as { id: string; t: number; user_name: string; action: string; detail: string };
+            if (!r?.id) return;
+            setContent((prev) => prev.activity.some((a) => a.id === r.id) ? prev : {
+              ...prev,
+              activity: [{ id: r.id, t: Number(r.t), user: r.user_name, action: r.action, detail: r.detail }, ...prev.activity].slice(0, 300),
+            });
+          })
+          .subscribe((status) => {
+            if (status === "CHANNEL_ERROR") setDbStatus((s) => (s === "online" ? "local" : s));
+          });
+      } catch {
+        if (!cancelled) setDbStatus("local");
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (channelRef.current) void supabase.removeChannel(channelRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     try {
@@ -87,6 +204,8 @@ export function CMSProvider({ children }: { children: React.ReactNode }) {
       else localStorage.removeItem(SESSION_KEY);
     } catch { /* ignore */ }
   }, [user]);
+
+  /* ---------------- mutations ---------------- */
 
   const save = useCallback((patch: Partial<CMSContent>) => {
     setContent((c) => ({ ...c, ...patch }));
@@ -101,14 +220,15 @@ export function CMSProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const log = useCallback((action: string, detail: string) => {
-    setContent((c) => ({
-      ...c,
-      activity: [
-        { id: uid(), t: Date.now(), user: user?.name || "System", action, detail } as ActivityEntry,
-        ...c.activity,
-      ].slice(0, 300),
-    }));
+    const entry: ActivityEntry = { id: uid(), t: Date.now(), user: user?.name || "System", action, detail };
+    setContent((c) => ({ ...c, activity: [entry, ...c.activity].slice(0, 300) }));
+    if (dbStatusRef.current === "online") void insertActivityRow(entry).catch(() => undefined);
   }, [user?.name]);
+
+  const clearActivity = useCallback(() => {
+    setContent((c) => ({ ...c, activity: [] }));
+    if (dbStatusRef.current === "online") void clearActivityRows().catch(() => undefined);
+  }, []);
 
   const upsert = useCallback(<K extends CollectionKey>(key: K, item: CMSContent[K][number] & { id: string }) => {
     setContent((c) => {
@@ -139,31 +259,37 @@ export function CMSProvider({ children }: { children: React.ReactNode }) {
       id: uid(), createdAt: Date.now(), read: false, status: "new",
       priority: "medium", tags: [], notes: [], archived: false, ...lead,
     };
-    setContent((c) => ({
-      ...c,
-      leads: [full, ...c.leads],
-      activity: [{ id: uid(), t: Date.now(), user: "Website", action: "New lead", detail: `${full.name} · ${full.source}${full.service ? ` · ${full.service}` : ""}` }, ...c.activity].slice(0, 300),
-    }));
+    const entry: ActivityEntry = { id: uid(), t: Date.now(), user: "Website", action: "New lead", detail: `${full.name} · ${full.source}${full.service ? ` · ${full.service}` : ""}` };
+    setContent((c) => ({ ...c, leads: [full, ...c.leads], activity: [entry, ...c.activity].slice(0, 300) }));
+    if (dbStatusRef.current === "online") {
+      void upsertLeadRow(full).catch(() => undefined);
+      void insertActivityRow(entry).catch(() => undefined);
+    }
     return full;
   }, []);
 
   const updateLead = useCallback((id: string, patch: Partial<Lead>) => {
-    setContent((c) => ({ ...c, leads: c.leads.map((l) => (l.id === id ? { ...l, ...patch } : l)) }));
+    setContent((c) => {
+      const updated = c.leads.map((l) => (l.id === id ? { ...l, ...patch } : l));
+      const full = updated.find((l) => l.id === id);
+      if (full && dbStatusRef.current === "online") void upsertLeadRow(full).catch(() => undefined);
+      return { ...c, leads: updated };
+    });
   }, []);
 
   const deleteLead = useCallback((id: string) => {
     setContent((c) => ({ ...c, leads: c.leads.filter((l) => l.id !== id) }));
+    if (dbStatusRef.current === "online") void deleteLeadRow(id).catch(() => undefined);
   }, []);
 
   const trackVisit = useCallback((path: string) => {
-    setContent((c) => {
-      const visit: Visit = {
-        t: Date.now(), path,
-        device: window.innerWidth < 768 ? "mobile" : "desktop",
-        source: document.referrer ? new URL(document.referrer, location.href).hostname : "direct",
-      };
-      return { ...c, visits: [...c.visits.slice(-999), visit] };
-    });
+    const visit: Visit = {
+      t: Date.now(), path,
+      device: window.innerWidth < 768 ? "mobile" : "desktop",
+      source: document.referrer ? new URL(document.referrer, location.href).hostname : "direct",
+    };
+    setContent((c) => ({ ...c, visits: [...c.visits.slice(-999), visit] }));
+    if (dbStatusRef.current === "online") void insertVisitRow(visit).catch(() => undefined);
   }, []);
 
   const addMedia = useCallback((files: MediaFile[]) => {
@@ -174,7 +300,7 @@ export function CMSProvider({ children }: { children: React.ReactNode }) {
     setContent((c) => ({ ...c, media: c.media.filter((m) => m.id !== id) }));
   }, []);
 
-  /* ---------------- auth ---------------- */
+  /* ---------------- auth (client-side workspace credentials) ---------------- */
 
   const login = useCallback((email: string, password: string) => {
     const pwds = loadPasswords();
@@ -182,11 +308,13 @@ export function CMSProvider({ children }: { children: React.ReactNode }) {
     if (!u || pwds[u.email] !== password) return { ok: false, error: "Invalid email or password." };
     const session: Session = { userId: u.id, email: u.email, name: u.name, role: u.role, t: Date.now() };
     setUser(session);
+    const entry: ActivityEntry = { id: uid(), t: Date.now(), user: u.name, action: "Login", detail: `Signed in as ${u.email}` };
     setContent((c) => ({
       ...c,
       users: c.users.map((x) => (x.id === u.id ? { ...x, lastActive: Date.now() } : x)),
-      activity: [{ id: uid(), t: Date.now(), user: u.name, action: "Login", detail: `Signed in as ${u.email}` }, ...c.activity].slice(0, 300),
+      activity: [entry, ...c.activity].slice(0, 300),
     }));
+    if (dbStatusRef.current === "online") void insertActivityRow(entry).catch(() => undefined);
     return { ok: true };
   }, [content.users]);
 
@@ -206,16 +334,15 @@ export function CMSProvider({ children }: { children: React.ReactNode }) {
 
   const resetPassword = useCallback((email: string, next: string) => {
     const pwds = loadPasswords();
-    const exists = content.users.some((x) => x.email.toLowerCase() === email.toLowerCase());
-    if (!exists) return { ok: false, error: "No admin account found for that email." };
-    pwds[content.users.find((x) => x.email.toLowerCase() === email.toLowerCase())!.email] = next;
+    const target = content.users.find((x) => x.email.toLowerCase() === email.toLowerCase());
+    if (!target) return { ok: false, error: "No admin account found for that email." };
+    pwds[target.email] = next;
     localStorage.setItem(AUTH_KEY, JSON.stringify(pwds));
     return { ok: true };
   }, [content.users]);
 
   const saveUsers = useCallback((users: AdminUser[]) => {
     setContent((c) => ({ ...c, users }));
-    // ensure passwords exist for new users
     const pwds = loadPasswords();
     users.forEach((u) => { if (!pwds[u.email]) pwds[u.email] = DEFAULT_PASSWORD; });
     localStorage.setItem(AUTH_KEY, JSON.stringify(pwds));
@@ -236,6 +363,19 @@ export function CMSProvider({ children }: { children: React.ReactNode }) {
   const resetAll = useCallback(() => {
     localStorage.removeItem(CMS_KEY);
     setContent(DEFAULT_CONTENT);
+    if (dbStatusRef.current === "online") {
+      const c = DEFAULT_CONTENT;
+      void saveSiteDoc(buildDoc(c)).catch(() => undefined);
+      void (async () => {
+        try {
+          await supabase.from("leads").delete().neq("id", "");
+          await Promise.all(c.leads.map((l) => upsertLeadRow(l).catch(() => undefined)));
+          await supabase.from("visits").delete().gt("id", 0);
+          await supabase.from("activity").delete().neq("id", "");
+          await Promise.all(c.activity.map((a) => insertActivityRow(a).catch(() => undefined)));
+        } catch { /* cloud wipe best-effort */ }
+      })();
+    }
   }, []);
 
   const exportData = useCallback(() => {
@@ -256,11 +396,11 @@ export function CMSProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const value = useMemo<CMSContextValue>(() => ({
-    content, save, updateSettings, updateHero, upsert, remove, move,
-    addLead, updateLead, deleteLead, log, trackVisit, addMedia, deleteMedia,
+    content, dbStatus, save, updateSettings, updateHero, upsert, remove, move,
+    addLead, updateLead, deleteLead, log, clearActivity, trackVisit, addMedia, deleteMedia,
     user, login, logout, logoutAll, changePassword, resetPassword, saveUsers, can,
     resetAll, exportData, importData,
-  }), [content, save, updateSettings, updateHero, upsert, remove, move, addLead, updateLead, deleteLead, log, trackVisit, addMedia, deleteMedia, user, login, logout, logoutAll, changePassword, resetPassword, saveUsers, can, resetAll, exportData, importData]);
+  }), [content, dbStatus, save, updateSettings, updateHero, upsert, remove, move, addLead, updateLead, deleteLead, log, clearActivity, trackVisit, addMedia, deleteMedia, user, login, logout, logoutAll, changePassword, resetPassword, saveUsers, can, resetAll, exportData, importData]);
 
   return <CMSContext.Provider value={value}>{children}</CMSContext.Provider>;
 }

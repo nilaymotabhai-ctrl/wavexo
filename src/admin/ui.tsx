@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { X, Trash2, Plus, ChevronUp, ChevronDown, Upload, ImageIcon, Check, AlertTriangle, Search } from "lucide-react";
 import { cn } from "../utils/cn";
 import { useCMS } from "../lib/store";
+import { processAndStoreImage } from "../lib/supabase";
 import { Icon, ICON_OPTIONS } from "../components/ui";
 
 /* ---------------- tiny toast bus ---------------- */
@@ -298,9 +299,9 @@ export function ImageField({ value, onChange, label }: { value?: string; onChang
   const upload = async (file: File) => {
     setBusy(true);
     try {
-      const { dataUrl } = await fileToOptimizedImage(file);
-      onChange(dataUrl);
-      toast("Image optimized & attached");
+      const { url, cloud } = await processAndStoreImage(file);
+      onChange(url);
+      toast(cloud ? "Image optimized & stored in cloud" : "Image optimized (saved inline)");
     } catch { toast("Could not process that image"); }
     setBusy(false);
   };

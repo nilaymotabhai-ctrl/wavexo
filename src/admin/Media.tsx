@@ -1,8 +1,9 @@
 import { useMemo, useRef, useState } from "react";
 import { UploadCloud, ImageIcon, FileText, Copy, Pencil, Trash2, SearchX, Check } from "lucide-react";
 import { useCMS, newId, timeAgo } from "../lib/store";
+import { processAndStoreImage, uploadToMediaBucket } from "../lib/supabase";
 import { MediaFile } from "../lib/types";
-import { AButton, ACard, AInput, ASearch, SectionTitle, Drawer, Confirm, fileToOptimizedImage, toast } from "./ui";
+import { AButton, ACard, AInput, ASearch, SectionTitle, Drawer, Confirm, toast } from "./ui";
 import { cn } from "../utils/cn";
 
 const fmtSize = (bytes: number) => bytes > 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
@@ -36,16 +37,20 @@ export default function MediaLibrary() {
     for (const file of Array.from(list)) {
       try {
         if (file.type.startsWith("image/")) {
-          const { dataUrl, size } = await fileToOptimizedImage(file);
-          uploaded.push({ id: newId(), name: file.name.replace(/\.[^.]+$/, "") + ".webp", type: "image/webp", size, dataUrl, uploadedAt: Date.now() });
+          const { url, size } = await processAndStoreImage(file);
+          uploaded.push({ id: newId(), name: file.name.replace(/\.[^.]+$/, "") + ".webp", type: "image/webp", size, dataUrl: url, uploadedAt: Date.now() });
         } else if (file.type === "application/pdf" && file.size < 900_000) {
-          const dataUrl = await new Promise<string>((res, rej) => {
-            const r = new FileReader();
-            r.onload = () => res(String(r.result));
-            r.onerror = rej;
-            r.readAsDataURL(file);
-          });
-          uploaded.push({ id: newId(), name: file.name, type: file.type, size: file.size, dataUrl, uploadedAt: Date.now() });
+          // try cloud storage first, fall back to inline data URL
+          let url = await uploadToMediaBucket(file, "pdf", "application/pdf");
+          if (!url) {
+            url = await new Promise<string>((res, rej) => {
+              const r = new FileReader();
+              r.onload = () => res(String(r.result));
+              r.onerror = rej;
+              r.readAsDataURL(file);
+            });
+          }
+          uploaded.push({ id: newId(), name: file.name, type: file.type, size: file.size, dataUrl: url, uploadedAt: Date.now() });
         } else {
           toast(`${file.name}: only images & PDFs under 900KB`);
         }
