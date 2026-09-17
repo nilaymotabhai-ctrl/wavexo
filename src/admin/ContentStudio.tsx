@@ -4,7 +4,7 @@ import {
   Phone, Mail, MapPin, Clock, Globe, CalendarCheck,
 } from "lucide-react";
 import { useCMS, newId } from "../lib/store";
-import { Metric } from "../lib/types";
+import { CMSContent, Metric } from "../lib/types";
 import {
   AField, AInput, ATextarea, AButton, ACard, AToggle, SectionTitle, ListEditor, toast,
 } from "./ui";
@@ -20,23 +20,60 @@ const TABS: { id: Tab; label: string; icon: typeof Building2; desc: string }[] =
   { id: "metrics", label: "Metrics & Trust", icon: BarChart3, desc: "Numbers strip, client names marquee" },
 ];
 
+interface Draft {
+  settings: CMSContent["settings"];
+  hero: CMSContent["hero"];
+  metrics: CMSContent["metrics"];
+  trustedBy: CMSContent["trustedBy"];
+}
+
+const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
+
+/* ------------------------------------------------------------------
+   FIX: all inputs edit a LOCAL draft initialized once on mount.
+   Nothing here reads live store values while typing, so realtime
+   Supabase sync can never overwrite in-progress edits — and no
+   inline component definitions exist, so nothing remounts.
+   The store (and therefore Supabase) is written ONLY on "Save".
+------------------------------------------------------------------- */
+
 export default function ContentStudio() {
   const { content, updateSettings, updateHero, save, log, can } = useCMS();
   const [tab, setTab] = useState<Tab>("brand");
-  const s = content.settings;
-  const h = content.hero;
   const editable = can("content");
 
-  const done = (what: string) => { toast(`${what} saved — live on the site`); log("Content updated", what); };
-
-  const Guard = ({ children }: { children: React.ReactNode }) => (
-    <fieldset disabled={!editable} className={cn(!editable && "opacity-60")}>{children}</fieldset>
+  const [d, setD] = useState<Draft>(() =>
+    clone({ settings: content.settings, hero: content.hero, metrics: content.metrics, trustedBy: content.trustedBy })
   );
+
+  const s = d.settings;
+  const h = d.hero;
+
+  const setS = (patch: Partial<Draft["settings"]>) =>
+    setD((p) => ({ ...p, settings: { ...p.settings, ...patch } }));
+  const setSocial = (k: keyof Draft["settings"]["socials"], v: string) =>
+    setD((p) => ({ ...p, settings: { ...p.settings, socials: { ...p.settings.socials, [k]: v } } }));
+  const setAnn = (patch: Partial<Draft["settings"]["announcement"]>) =>
+    setD((p) => ({ ...p, settings: { ...p.settings, announcement: { ...p.settings.announcement, ...patch } } }));
+  const setH = (patch: Partial<Draft["hero"]>) =>
+    setD((p) => ({ ...p, hero: { ...p.hero, ...patch } }));
+  const setMetrics = (fn: (m: Draft["metrics"]) => Draft["metrics"]) =>
+    setD((p) => ({ ...p, metrics: fn(p.metrics) }));
+
+  /* explicit save — the ONLY path that writes to the store/Supabase */
+  const apply = (what: string) => {
+    if (!editable) return;
+    updateSettings(d.settings);
+    updateHero(d.hero);
+    save({ metrics: d.metrics, trustedBy: d.trustedBy });
+    toast(`${what} saved — live everywhere`);
+    log("Content updated", what);
+  };
 
   return (
     <div>
       <SectionTitle title="Site Content & Offers"
-        sub="Edit the text, contact details, offers and hero copy shown across the website. Everything saves instantly."
+        sub="Edit text, contact details, offers and hero copy. Nothing publishes until you press “Save & publish”."
         right={!editable && <span className="text-xs font-semibold text-amber-300">Read-only for your role</span>} />
 
       <div className="grid gap-6 lg:grid-cols-[240px_1fr]">
@@ -55,19 +92,21 @@ export default function ContentStudio() {
           ))}
         </div>
 
-        <Guard>
+        {/* plain fieldset (NOT an inline component) — never remounts */}
+        <fieldset disabled={!editable} className={cn(!editable && "opacity-60")}>
+
           {/* ---------------- BRAND & CONTACT ---------------- */}
           {tab === "brand" && (
             <div className="space-y-5">
               <ACard>
                 <h3 className="font-display text-[15px] font-bold text-white">Brand identity</h3>
                 <div className="mt-4 grid gap-4 sm:grid-cols-2">
-                  <AField label="Site / brand name"><AInput value={s.siteName} onChange={(e) => updateSettings({ siteName: e.target.value })} /></AField>
-                  <AField label="Tagline"><AInput value={s.tagline} onChange={(e) => updateSettings({ tagline: e.target.value })} /></AField>
+                  <AField label="Site / brand name"><AInput value={s.siteName} onChange={(e) => setS({ siteName: e.target.value })} /></AField>
+                  <AField label="Tagline"><AInput value={s.tagline} onChange={(e) => setS({ tagline: e.target.value })} /></AField>
                 </div>
                 <div className="mt-4">
                   <AField label="Footer description" hint="Shown under your logo in the footer.">
-                    <ATextarea value={s.footerText} onChange={(e) => updateSettings({ footerText: e.target.value })} />
+                    <ATextarea value={s.footerText} onChange={(e) => setS({ footerText: e.target.value })} />
                   </AField>
                 </div>
               </ACard>
@@ -76,22 +115,22 @@ export default function ContentStudio() {
                 <h3 className="font-display text-[15px] font-bold text-white">Contact details</h3>
                 <p className="mt-1 text-[11px] text-faint">Used in the navbar, contact page, footer and all WhatsApp buttons across the site.</p>
                 <div className="mt-4 grid gap-4 sm:grid-cols-2">
-                  <AField label="Email address"><div className="relative"><Mail className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-faint" /><AInput className="!pl-10" value={s.email} onChange={(e) => updateSettings({ email: e.target.value })} /></div></AField>
-                  <AField label="Phone number"><div className="relative"><Phone className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-faint" /><AInput className="!pl-10" value={s.phone} onChange={(e) => updateSettings({ phone: e.target.value })} /></div></AField>
+                  <AField label="Email address"><div className="relative"><Mail className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-faint" /><AInput className="!pl-10" value={s.email} onChange={(e) => setS({ email: e.target.value })} /></div></AField>
+                  <AField label="Phone number"><div className="relative"><Phone className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-faint" /><AInput className="!pl-10" value={s.phone} onChange={(e) => setS({ phone: e.target.value })} /></div></AField>
                   <AField label="WhatsApp number (with country code, digits only)" hint="e.g. 919876543210 — powers every WhatsApp button & chat link.">
-                    <AInput value={s.whatsapp} onChange={(e) => updateSettings({ whatsapp: e.target.value.replace(/[^\d]/g, "") })} placeholder="919876543210" />
+                    <AInput value={s.whatsapp} onChange={(e) => setS({ whatsapp: e.target.value.replace(/[^\d]/g, "") })} placeholder="919876543210" />
                   </AField>
-                  <AField label="Business hours"><div className="relative"><Clock className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-faint" /><AInput className="!pl-10" value={s.hours} onChange={(e) => updateSettings({ hours: e.target.value })} /></div></AField>
+                  <AField label="Business hours"><div className="relative"><Clock className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-faint" /><AInput className="!pl-10" value={s.hours} onChange={(e) => setS({ hours: e.target.value })} /></div></AField>
                 </div>
                 <div className="mt-4 grid gap-4">
-                  <AField label="Office address"><div className="relative"><MapPin className="absolute left-3.5 top-3.5 h-4 w-4 text-faint" /><ATextarea className="!min-h-[64px] !pl-10" value={s.address} onChange={(e) => updateSettings({ address: e.target.value })} /></div></AField>
+                  <AField label="Office address"><div className="relative"><MapPin className="absolute left-3.5 top-3.5 h-4 w-4 text-faint" /><ATextarea className="!min-h-[64px] !pl-10" value={s.address} onChange={(e) => setS({ address: e.target.value })} /></div></AField>
                   <AField label="Google Maps embed URL" hint='Google Maps → Share → Embed a map → copy the "src" URL.'>
-                    <div className="relative"><Globe className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-faint" /><AInput className="!pl-10" value={s.mapUrl} onChange={(e) => updateSettings({ mapUrl: e.target.value })} /></div>
+                    <div className="relative"><Globe className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-faint" /><AInput className="!pl-10" value={s.mapUrl} onChange={(e) => setS({ mapUrl: e.target.value })} /></div>
                   </AField>
-                  <AField label="Calendly / booking calendar URL (optional)"><div className="relative"><CalendarCheck className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-faint" /><AInput className="!pl-10" value={s.calendlyUrl} onChange={(e) => updateSettings({ calendlyUrl: e.target.value })} placeholder="https://calendly.com/wavexo/30min" /></div></AField>
+                  <AField label="Calendly / booking calendar URL (optional)"><div className="relative"><CalendarCheck className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-faint" /><AInput className="!pl-10" value={s.calendlyUrl} onChange={(e) => setS({ calendlyUrl: e.target.value })} placeholder="https://calendly.com/wavexo/30min" /></div></AField>
                 </div>
               </ACard>
-              <AButton onClick={() => done("Brand & contact details")}><Save className="h-4 w-4" /> Save & publish</AButton>
+              <AButton onClick={() => apply("Brand & contact details")}><Save className="h-4 w-4" /> Save & publish</AButton>
             </div>
           )}
 
@@ -104,12 +143,12 @@ export default function ContentStudio() {
                 <div className="mt-4 grid gap-4 sm:grid-cols-2">
                   {(Object.keys(s.socials) as (keyof typeof s.socials)[]).map((k) => (
                     <AField key={k} label={k.charAt(0).toUpperCase() + k.slice(1)}>
-                      <AInput value={s.socials[k]} onChange={(e) => updateSettings({ socials: { ...s.socials, [k]: e.target.value } })} placeholder={`https://${k}.com/yourpage`} />
+                      <AInput value={s.socials[k]} onChange={(e) => setSocial(k, e.target.value)} placeholder={`https://${k}.com/yourpage`} />
                     </AField>
                   ))}
                 </div>
               </ACard>
-              <AButton onClick={() => done("Social links")}><Save className="h-4 w-4" /> Save & publish</AButton>
+              <AButton onClick={() => apply("Social links")}><Save className="h-4 w-4" /> Save & publish</AButton>
             </div>
           )}
 
@@ -120,22 +159,22 @@ export default function ContentStudio() {
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <h3 className="font-display text-[15px] font-bold text-white">Announcement / offer bar</h3>
-                    <p className="mt-1 text-[11px] text-faint">A slim gradient banner above the navbar — perfect for limited-time offers, discounts and announcements.</p>
+                    <p className="mt-1 text-[11px] text-faint">A slim gradient banner above the navbar — perfect for limited-time offers, discounts and announcements. Goes live only after Save.</p>
                   </div>
-                  <AToggle checked={s.announcement.enabled} onChange={(v) => { updateSettings({ announcement: { ...s.announcement, enabled: v } }); toast(v ? "Offer bar is now LIVE" : "Offer bar hidden"); }} label={s.announcement.enabled ? "Live" : "Hidden"} />
+                  <AToggle checked={s.announcement.enabled} onChange={(v) => setAnn({ enabled: v })} label={s.announcement.enabled ? "Will show" : "Will hide"} />
                 </div>
                 <div className="mt-5 space-y-4">
-                  <AField label="Offer text"><AInput value={s.announcement.text} onChange={(e) => updateSettings({ announcement: { ...s.announcement, text: e.target.value } })} placeholder="Diwali offer: 30% off all packages this week!" /></AField>
+                  <AField label="Offer text"><AInput value={s.announcement.text} onChange={(e) => setAnn({ text: e.target.value })} placeholder="Diwali offer: 30% off all packages this week!" /></AField>
                   <div className="grid gap-4 sm:grid-cols-2">
-                    <AField label="Button text"><AInput value={s.announcement.cta} onChange={(e) => updateSettings({ announcement: { ...s.announcement, cta: e.target.value } })} placeholder="Claim Offer" /></AField>
-                    <AField label="Button link"><AInput value={s.announcement.href} onChange={(e) => updateSettings({ announcement: { ...s.announcement, href: e.target.value } })} placeholder="/contact or /pricing" /></AField>
+                    <AField label="Button text"><AInput value={s.announcement.cta} onChange={(e) => setAnn({ cta: e.target.value })} placeholder="Claim Offer" /></AField>
+                    <AField label="Button link"><AInput value={s.announcement.href} onChange={(e) => setAnn({ href: e.target.value })} placeholder="/contact or /pricing" /></AField>
                   </div>
                 </div>
               </ACard>
 
-              {/* live preview */}
+              {/* live preview of the DRAFT */}
               <ACard>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-faint">Live preview</p>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-faint">Preview of your draft</p>
                 {s.announcement.enabled ? (
                   <div className="mt-3 rounded-xl bg-gradient-to-r from-electric/90 via-violetx/90 to-magentax/90 px-4 py-2.5 text-center">
                     <p className="truncate text-xs font-medium text-white">{s.announcement.text || "Your offer text here…"}
@@ -143,7 +182,7 @@ export default function ContentStudio() {
                     </p>
                   </div>
                 ) : (
-                  <p className="mt-3 rounded-xl border border-dashed border-white/12 px-4 py-5 text-center text-xs text-faint">Offer bar is currently hidden on the website.</p>
+                  <p className="mt-3 rounded-xl border border-dashed border-white/12 px-4 py-5 text-center text-xs text-faint">Offer bar will be hidden after you save.</p>
                 )}
               </ACard>
 
@@ -155,7 +194,7 @@ export default function ContentStudio() {
                   <li>→ Flash deals? Announce them in the <b className="text-white">Blog</b> and link from the offer bar</li>
                 </ul>
               </ACard>
-              <AButton onClick={() => done("Offer bar")}><Save className="h-4 w-4" /> Save & publish</AButton>
+              <AButton onClick={() => apply("Offer bar")}><Save className="h-4 w-4" /> Save & publish</AButton>
             </div>
           )}
 
@@ -164,39 +203,41 @@ export default function ContentStudio() {
             <div className="space-y-5">
               <ACard>
                 <h3 className="font-display text-[15px] font-bold text-white">Headline builder</h3>
-                <p className="mt-1 text-[11px] text-faint">The big headline on the homepage. Gradient fields appear highlighted: "We Help Businesses <b className="text-white">Grow</b> With <b className="text-white">Digital Marketing & Technology</b>."</p>
+                <p className="mt-1 text-[11px] text-faint">The big headline on the homepage. Gradient fields appear highlighted.</p>
                 <div className="mt-4 grid gap-4 sm:grid-cols-2">
-                  <AField label="Badge text"><AInput value={h.badge} onChange={(e) => updateHero({ badge: e.target.value })} /></AField>
-                  <AField label="Opening (before highlight)"><AInput value={h.headingStart} onChange={(e) => updateHero({ headingStart: e.target.value })} /></AField>
-                  <AField label="Highlight 1 (gradient)"><AInput value={h.grad1} onChange={(e) => updateHero({ grad1: e.target.value })} /></AField>
-                  <AField label="Connector word"><AInput value={h.headingMiddle} onChange={(e) => updateHero({ headingMiddle: e.target.value })} /></AField>
-                  <AField label="Highlight 2 (gradient)"><AInput value={h.grad2} onChange={(e) => updateHero({ grad2: e.target.value })} /></AField>
-                  <AField label="Ending punctuation"><AInput value={h.headingEnd} onChange={(e) => updateHero({ headingEnd: e.target.value })} /></AField>
+                  <AField label="Badge text"><AInput value={h.badge} onChange={(e) => setH({ badge: e.target.value })} /></AField>
+                  <AField label="Opening (before highlight)"><AInput value={h.headingStart} onChange={(e) => setH({ headingStart: e.target.value })} /></AField>
+                  <AField label="Highlight 1 (gradient)"><AInput value={h.grad1} onChange={(e) => setH({ grad1: e.target.value })} /></AField>
+                  <AField label="Connector word"><AInput value={h.headingMiddle} onChange={(e) => setH({ headingMiddle: e.target.value })} /></AField>
+                  <AField label="Highlight 2 (gradient)"><AInput value={h.grad2} onChange={(e) => setH({ grad2: e.target.value })} /></AField>
+                  <AField label="Ending punctuation"><AInput value={h.headingEnd} onChange={(e) => setH({ headingEnd: e.target.value })} /></AField>
                 </div>
                 <div className="mt-4">
-                  <AField label="Subtitle"><ATextarea value={h.subtitle} onChange={(e) => updateHero({ subtitle: e.target.value })} /></AField>
+                  <AField label="Subtitle"><ATextarea value={h.subtitle} onChange={(e) => setH({ subtitle: e.target.value })} /></AField>
                 </div>
                 <div className="mt-4 grid gap-4 sm:grid-cols-2">
-                  <AField label="Primary button"><AInput value={h.primaryCta} onChange={(e) => updateHero({ primaryCta: e.target.value })} /></AField>
-                  <AField label="Secondary button"><AInput value={h.secondaryCta} onChange={(e) => updateHero({ secondaryCta: e.target.value })} /></AField>
+                  <AField label="Primary button"><AInput value={h.primaryCta} onChange={(e) => setH({ primaryCta: e.target.value })} /></AField>
+                  <AField label="Secondary button"><AInput value={h.secondaryCta} onChange={(e) => setH({ secondaryCta: e.target.value })} /></AField>
                 </div>
               </ACard>
 
               <ACard>
                 <h3 className="font-display text-[15px] font-bold text-white">Trust line (comma separated)</h3>
-                <AInput className="mt-3" value={h.trustItems.join(", ")} onChange={(e) => updateHero({ trustItems: e.target.value.split(",").map((x) => x.trim()).filter(Boolean) })} placeholder="Strategy, Creativity, Technology, Growth" />
+                <AInput className="mt-3" value={h.trustItems.join(", ")}
+                  onChange={(e) => setH({ trustItems: e.target.value.split(",").map((x) => x.trim()).filter(Boolean) })}
+                  placeholder="Strategy, Creativity, Technology, Growth" />
               </ACard>
 
               <ACard>
                 <h3 className="font-display text-[15px] font-bold text-white">Floating stat cards (desktop hero)</h3>
                 <div className="mt-4 grid gap-4 sm:grid-cols-2">
-                  <AField label="Card 1 label"><AInput value={h.cardOneLabel} onChange={(e) => updateHero({ cardOneLabel: e.target.value })} /></AField>
-                  <AField label="Card 1 value"><AInput value={h.cardOneValue} onChange={(e) => updateHero({ cardOneValue: e.target.value })} /></AField>
-                  <AField label="Card 2 label"><AInput value={h.cardTwoLabel} onChange={(e) => updateHero({ cardTwoLabel: e.target.value })} /></AField>
-                  <AField label="Card 2 value"><AInput value={h.cardTwoValue} onChange={(e) => updateHero({ cardTwoValue: e.target.value })} /></AField>
+                  <AField label="Card 1 label"><AInput value={h.cardOneLabel} onChange={(e) => setH({ cardOneLabel: e.target.value })} /></AField>
+                  <AField label="Card 1 value"><AInput value={h.cardOneValue} onChange={(e) => setH({ cardOneValue: e.target.value })} /></AField>
+                  <AField label="Card 2 label"><AInput value={h.cardTwoLabel} onChange={(e) => setH({ cardTwoLabel: e.target.value })} /></AField>
+                  <AField label="Card 2 value"><AInput value={h.cardTwoValue} onChange={(e) => setH({ cardTwoValue: e.target.value })} /></AField>
                 </div>
               </ACard>
-              <AButton onClick={() => done("Homepage hero")}><Save className="h-4 w-4" /> Save & publish</AButton>
+              <AButton onClick={() => apply("Homepage hero")}><Save className="h-4 w-4" /> Save & publish</AButton>
             </div>
           )}
 
@@ -209,35 +250,35 @@ export default function ContentStudio() {
                     <h3 className="font-display text-[15px] font-bold text-white">Animated numbers strip</h3>
                     <p className="mt-1 text-[11px] text-faint">Only show numbers you can stand behind — they build (or break) trust.</p>
                   </div>
-                  <AToggle checked={s.showStats} onChange={(v) => updateSettings({ showStats: v })} label={s.showStats ? "Visible" : "Hidden"} />
+                  <AToggle checked={s.showStats} onChange={(v) => setS({ showStats: v })} label={s.showStats ? "Will show" : "Will hide"} />
                 </div>
                 <div className="mt-4 space-y-2.5">
-                  {content.metrics.map((m, i) => (
+                  {d.metrics.map((m, i) => (
                     <div key={i} className="grid grid-cols-[1fr_100px_80px] gap-2">
-                      <AInput value={m.label} placeholder="Label" onChange={(e) => save({ metrics: content.metrics.map((x, j) => (j === i ? { ...x, label: e.target.value } : x)) })} />
-                      <AInput type="number" value={m.value} placeholder="Value" onChange={(e) => save({ metrics: content.metrics.map((x, j) => (j === i ? { ...x, value: Number(e.target.value) } : x)) })} />
-                      <AInput value={m.suffix} placeholder="Suffix" onChange={(e) => save({ metrics: content.metrics.map((x, j) => (j === i ? { ...x, suffix: e.target.value } : x)) })} />
+                      <AInput value={m.label} placeholder="Label" onChange={(e) => setMetrics((arr) => arr.map((x, j) => (j === i ? { ...x, label: e.target.value } : x)))} />
+                      <AInput type="number" value={m.value} placeholder="Value" onChange={(e) => setMetrics((arr) => arr.map((x, j) => (j === i ? { ...x, value: Number(e.target.value) } : x)))} />
+                      <AInput value={m.suffix} placeholder="Suffix" onChange={(e) => setMetrics((arr) => arr.map((x, j) => (j === i ? { ...x, suffix: e.target.value } : x)))} />
                     </div>
                   ))}
-                  <AButton variant="ghost" onClick={() => save({ metrics: [...content.metrics, { label: "New Metric", value: 100, suffix: "+" } as Metric] })}>+ Add metric</AButton>
+                  <AButton variant="ghost" onClick={() => setMetrics((arr) => [...arr, { label: "New Metric", value: 100, suffix: "+" } as Metric])}>+ Add metric</AButton>
                 </div>
               </ACard>
 
               <ACard>
                 <h3 className="font-display text-[15px] font-bold text-white">"Trusted by" marquee names</h3>
-                <p className="mt-1 text-[11px] text-faint">Replace these placeholders with your real client names — honesty here converts better than stock logos.</p>
+                <p className="mt-1 text-[11px] text-faint">Replace these placeholders with your real client names.</p>
                 <div className="mt-4">
                   <ListEditor
-                    items={content.trustedBy.map((t) => t.name)}
-                    onChange={(names) => save({ trustedBy: names.map((name, i) => ({ id: content.trustedBy[i]?.id || newId(), name })) })}
+                    items={d.trustedBy.map((t) => t.name)}
+                    onChange={(names) => setD((p) => ({ ...p, trustedBy: names.map((name, i) => ({ id: p.trustedBy[i]?.id || newId(), name })) }))}
                     placeholder="Client name"
                   />
                 </div>
               </ACard>
-              <AButton onClick={() => done("Metrics & trust")}><Save className="h-4 w-4" /> Save & publish</AButton>
+              <AButton onClick={() => apply("Metrics & trust")}><Save className="h-4 w-4" /> Save & publish</AButton>
             </div>
           )}
-        </Guard>
+        </fieldset>
       </div>
     </div>
   );

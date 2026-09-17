@@ -44,6 +44,18 @@ export default function Settings() {
   const s = content.settings;
   const allowed = can("settings");
 
+  /* local draft for integration fields — written to the store/Supabase
+     ONLY when the admin presses "Save integrations". Initialized once,
+     so realtime sync can never overwrite in-progress typing. */
+  const [int, setInt] = useState(() =>
+    JSON.parse(JSON.stringify({
+      gaId: s.gaId, gtmId: s.gtmId, pixelId: s.pixelId,
+      gscVerification: s.gscVerification, smtp: s.smtp,
+    })) as { gaId: string; gtmId: string; pixelId: string; gscVerification: string; smtp: typeof s.smtp }
+  );
+  const setIntField = (k: "gaId" | "gtmId" | "pixelId" | "gscVerification", v: string) => setInt((p: typeof int) => ({ ...p, [k]: v }));
+  const setSmtp = (patch: Partial<typeof int.smtp>) => setInt((p: typeof int) => ({ ...p, smtp: { ...p.smtp, ...patch } }));
+
   if (!allowed) {
     return (
       <div>
@@ -78,23 +90,27 @@ export default function Settings() {
             <h3 className="font-display text-[15px] font-bold text-white">Analytics & tracking</h3>
             <p className="mt-1 text-[11px] text-faint">Paste your IDs — they're stored safely and never exposed publicly in page code beyond standard snippets.</p>
             <div className="mt-4 grid gap-4 sm:grid-cols-2">
-              <AField label="Google Analytics 4 ID" hint="G-XXXXXXXXXX"><AInput value={s.gaId} onChange={(e) => updateSettings({ gaId: e.target.value })} placeholder="G-XXXXXXXXXX" /></AField>
-              <AField label="Google Tag Manager ID" hint="GTM-XXXXXXX"><AInput value={s.gtmId} onChange={(e) => updateSettings({ gtmId: e.target.value })} placeholder="GTM-XXXXXXX" /></AField>
-              <AField label="Meta Pixel ID"><AInput value={s.pixelId} onChange={(e) => updateSettings({ pixelId: e.target.value })} placeholder="1234567890" /></AField>
-              <AField label="Search Console verification"><AInput value={s.gscVerification} onChange={(e) => updateSettings({ gscVerification: e.target.value })} /></AField>
+              <AField label="Google Analytics 4 ID" hint="G-XXXXXXXXXX"><AInput value={int.gaId} onChange={(e) => setIntField("gaId", e.target.value)} placeholder="G-XXXXXXXXXX" /></AField>
+              <AField label="Google Tag Manager ID" hint="GTM-XXXXXXX"><AInput value={int.gtmId} onChange={(e) => setIntField("gtmId", e.target.value)} placeholder="GTM-XXXXXXX" /></AField>
+              <AField label="Meta Pixel ID"><AInput value={int.pixelId} onChange={(e) => setIntField("pixelId", e.target.value)} placeholder="1234567890" /></AField>
+              <AField label="Search Console verification"><AInput value={int.gscVerification} onChange={(e) => setIntField("gscVerification", e.target.value)} /></AField>
             </div>
           </ACard>
           <ACard>
             <h3 className="font-display text-[15px] font-bold text-white">SMTP email (lead notifications)</h3>
             <div className="mt-4 grid gap-4 sm:grid-cols-2">
-              <AField label="SMTP host"><AInput value={s.smtp.host} onChange={(e) => updateSettings({ smtp: { ...s.smtp, host: e.target.value } })} placeholder="smtp.resend.com" /></AField>
-              <AField label="Port"><AInput value={s.smtp.port} onChange={(e) => updateSettings({ smtp: { ...s.smtp, port: e.target.value } })} placeholder="587" /></AField>
-              <AField label="Username"><AInput value={s.smtp.user} onChange={(e) => updateSettings({ smtp: { ...s.smtp, user: e.target.value } })} /></AField>
-              <AField label="Password / API key"><AInput type="password" value={s.smtp.pass} onChange={(e) => updateSettings({ smtp: { ...s.smtp, pass: e.target.value } })} /></AField>
+              <AField label="SMTP host"><AInput value={int.smtp.host} onChange={(e) => setSmtp({ host: e.target.value })} placeholder="smtp.resend.com" /></AField>
+              <AField label="Port"><AInput value={int.smtp.port} onChange={(e) => setSmtp({ port: e.target.value })} placeholder="587" /></AField>
+              <AField label="Username"><AInput value={int.smtp.user} onChange={(e) => setSmtp({ user: e.target.value })} /></AField>
+              <AField label="Password / API key"><AInput type="password" value={int.smtp.pass} onChange={(e) => setSmtp({ pass: e.target.value })} /></AField>
             </div>
             <p className="mt-3 text-[11px] text-faint">Used to email you when a new lead arrives. Connect any provider (Resend, SendGrid, Gmail SMTP, SES).</p>
           </ACard>
-          <AButton onClick={() => { toast("Integrations saved"); log("Settings updated", "Integrations"); }}><Save className="h-4 w-4" /> Save integrations</AButton>
+          <AButton onClick={() => {
+            updateSettings({ gaId: int.gaId, gtmId: int.gtmId, pixelId: int.pixelId, gscVerification: int.gscVerification, smtp: int.smtp });
+            toast("Integrations saved — live everywhere");
+            log("Settings updated", "Integrations");
+          }}><Save className="h-4 w-4" /> Save integrations</AButton>
         </div>
       )}
 

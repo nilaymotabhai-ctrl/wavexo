@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Download, Mail, Phone, Trash2, Archive, Globe, Paperclip,
   CalendarDays, Tag as TagIcon, UserCheck, MessageSquarePlus, Send,
@@ -30,6 +30,15 @@ export default function Leads() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [note, setNote] = useState("");
+  const [tagsDraft, setTagsDraft] = useState("");
+
+  /* local tags draft — initialized when a lead is opened, so realtime
+     lead updates from other sessions never clobber in-progress typing */
+  useEffect(() => {
+    const lead = content.leads.find((l) => l.id === activeId);
+    setTagsDraft(lead ? lead.tags.join(", ") : "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId]);
 
   const leads = useMemo(() => {
     return content.leads.filter((l) => {
@@ -194,8 +203,17 @@ export default function Leads() {
               </AField>
             </div>
 
-            <AField label="Tags (comma separated)">
-              <AInput value={active.tags.join(", ")} onChange={(e) => patch(active.id, { tags: e.target.value.split(",").map((t) => t.trim()).filter(Boolean) })} placeholder="ecommerce, hot, referral" />
+            <AField label="Tags (comma separated) — saved when you leave the field">
+              <AInput value={tagsDraft}
+                onChange={(e) => setTagsDraft(e.target.value)}
+                onBlur={() => {
+                  const tags = tagsDraft.split(",").map((t) => t.trim()).filter(Boolean);
+                  if (tags.join("|") !== active.tags.join("|")) {
+                    patch(active.id, { tags });
+                    toast("Tags updated");
+                  }
+                }}
+                placeholder="ecommerce, hot, referral" />
             </AField>
 
             {/* notes */}

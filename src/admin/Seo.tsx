@@ -13,6 +13,10 @@ export default function SeoManager() {
   const [redirect, setRedirect] = useState({ from: "", to: "" });
   const editable = can("content");
 
+  /* local drafts for free-text SEO fields — saved only on button click */
+  const [robotsDraft, setRobotsDraft] = useState(content.robotsTxt);
+  const [gscDraft, setGscDraft] = useState(content.settings.gscVerification);
+
   const sitemap = useMemo(() => {
     const base = "https://wavexo.agency";
     const urls = new Set<string>();
@@ -80,14 +84,22 @@ export default function SeoManager() {
         {/* robots */}
         <ACard>
           <h3 className="font-display flex items-center gap-2 text-[15px] font-bold text-white"><FileCode className="h-4 w-4 text-cyan-300" /> robots.txt</h3>
-          <ATextarea className="mt-4 h-44 font-mono !text-[11px]" value={content.robotsTxt}
-            onChange={(e) => editable && save({ robotsTxt: e.target.value })} readOnly={!editable} />
+          <ATextarea className="mt-4 h-44 font-mono !text-[11px]" value={robotsDraft}
+            onChange={(e) => setRobotsDraft(e.target.value)} readOnly={!editable} />
           <div className="mt-3">
             <AField label="Google Search Console verification code (content attribute)">
-              <AInput value={content.settings.gscVerification} readOnly={!editable}
-                onChange={(e) => updateSettings({ gscVerification: e.target.value })} placeholder="e.g. abc123XYZ…" />
+              <AInput value={gscDraft} readOnly={!editable}
+                onChange={(e) => setGscDraft(e.target.value)} placeholder="e.g. abc123XYZ…" />
             </AField>
           </div>
+          {editable && (
+            <AButton className="mt-3" onClick={() => {
+              save({ robotsTxt: robotsDraft });
+              updateSettings({ gscVerification: gscDraft });
+              log("SEO updated", "robots.txt & verification");
+              toast("robots.txt & verification saved");
+            }}>Save robots & verification</AButton>
+          )}
         </ACard>
       </div>
 
